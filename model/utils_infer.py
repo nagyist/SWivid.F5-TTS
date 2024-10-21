@@ -22,13 +22,6 @@ from model.utils import (
 device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 print(f"Using {device} device")
 
-asr_pipe = pipeline(
-    "automatic-speech-recognition",
-    model="openai/whisper-large-v3-turbo",
-    torch_dtype=torch.float16,
-    device=device,
-)
-
 vocos = Vocos.from_pretrained("charactr/vocos-mel-24khz")
 
 
@@ -38,9 +31,10 @@ target_sample_rate = 24000
 n_mel_channels = 100
 hop_length = 256
 target_rms = 0.1
+cross_fade_duration = 0.15
+ode_method = "euler"
 nfe_step = 32  # 16, 32
 cfg_strength = 2.0
-ode_method = "euler"
 sway_sampling_coef = -1.0
 speed = 1.0
 fix_duration = None
@@ -82,9 +76,7 @@ def chunk_text(text, max_chars=135):
 
 
 # load vocoder
-
-
-def load_vocoder(is_local=False, local_path=""):
+def load_vocoder(is_local=False, local_path="", device=device):
     if is_local:
         print(f"Load vocos from local path {local_path}")
         vocos = Vocos.from_hparams(f"{local_path}/config.yaml")
@@ -97,17 +89,33 @@ def load_vocoder(is_local=False, local_path=""):
     return vocos
 
 
+# load asr pipeline
+
+asr_pipe = None
+
+
+def initialize_asr_pipeline(device=device):
+    global asr_pipe
+
+    asr_pipe = pipeline(
+        "automatic-speech-recognition",
+        model="openai/whisper-large-v3-turbo",
+        torch_dtype=torch.float16,
+        device=device,
+    )
+
+
 # load model for inference
 
 
-def load_model(model_cls, model_cfg, ckpt_path, vocab_file=""):
+def load_model(model_cls, model_cfg, ckpt_path, vocab_file="", ode_method=ode_method, use_ema=True, device=device):
     if vocab_file == "":
         vocab_file = "Emilia_ZH_EN"
         tokenizer = "pinyin"
     else:
         tokenizer = "custom"
 
-    print("\nvocab : ", vocab_file, tokenizer)
+    print("\nvocab : ", vocab_file)
     print("tokenizer : ", tokenizer)
     print("model : ", ckpt_path, "\n")
 
@@ -125,7 +133,7 @@ def load_model(model_cls, model_cfg, ckpt_path, vocab_file=""):
         vocab_char_map=vocab_char_map,
     ).to(device)
 
-    model = load_checkpoint(model, ckpt_path, device, use_ema=True)
+    model = load_checkpoint(model, ckpt_path, device, use_ema=use_ema)
 
     return model
 
@@ -133,7 +141,7 @@ def load_model(model_cls, model_cfg, ckpt_path, vocab_file=""):
 # preprocess reference audio and text
 
 
-def preprocess_ref_audio_text(ref_audio_orig, ref_text, show_info=print):
+def preprocess_ref_audio_text(ref_audio_orig, ref_text, show_info=print, device=device):
     show_info("Converting audio...")
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
         aseg = AudioSegment.from_file(ref_audio_orig)
@@ -152,6 +160,9 @@ def preprocess_ref_audio_text(ref_audio_orig, ref_text, show_info=print):
         ref_audio = f.name
 
     if not ref_text.strip():
+        global asr_pipe
+        if asr_pipe is None:
+            initialize_asr_pipeline(device=device)
         show_info("No reference text provided, transcribing reference audio...")
         ref_text = asr_pipe(
             ref_audio,
@@ -178,7 +189,19 @@ def preprocess_ref_audio_text(ref_audio_orig, ref_text, show_info=print):
 
 
 def infer_process(
-    ref_audio, ref_text, gen_text, model_obj, cross_fade_duration=0.15, speed=speed, show_info=print, progress=tqdm
+    ref_audio,
+    ref_text,
+    gen_text,
+    model_obj,
+    show_info=print,
+    progress=tqdm,
+    target_rms=target_rms,
+    cross_fade_duration=cross_fade_duration,
+    nfe_step=nfe_step,
+    cfg_strength=cfg_strength,
+    sway_sampling_coef=sway_sampling_coef,
+    speed=speed,
+    fix_duration=fix_duration,
 ):
     # Split the input text into batches
     audio, sr = torchaudio.load(ref_audio)
@@ -188,14 +211,38 @@ def infer_process(
         print(f"gen_text {i}", gen_text)
 
     show_info(f"Generating audio in {len(gen_text_batches)} batches...")
-    return infer_batch_process((audio, sr), ref_text, gen_text_batches, model_obj, cross_fade_duration, speed, progress)
+    return infer_batch_process(
+        (audio, sr),
+        ref_text,
+        gen_text_batches,
+        model_obj,
+        progress=progress,
+        target_rms=target_rms,
+        cross_fade_duration=cross_fade_duration,
+        nfe_step=nfe_step,
+        cfg_strength=cfg_strength,
+        sway_sampling_coef=sway_sampling_coef,
+        speed=speed,
+        fix_duration=fix_duration,
+    )
 
 
 # infer batches
 
 
 def infer_batch_process(
-    ref_audio, ref_text, gen_text_batches, model_obj, cross_fade_duration=0.15, speed=1, progress=tqdm
+    ref_audio,
+    ref_text,
+    gen_text_batches,
+    model_obj,
+    progress=tqdm,
+    target_rms=0.1,
+    cross_fade_duration=0.15,
+    nfe_step=32,
+    cfg_strength=2.0,
+    sway_sampling_coef=-1,
+    speed=1,
+    fix_duration=None,
 ):
     audio, sr = ref_audio
     if audio.shape[0] > 1:
@@ -219,11 +266,14 @@ def infer_batch_process(
         text_list = [ref_text + gen_text]
         final_text_list = convert_char_to_pinyin(text_list)
 
-        # Calculate duration
         ref_audio_len = audio.shape[-1] // hop_length
-        ref_text_len = len(ref_text.encode("utf-8"))
-        gen_text_len = len(gen_text.encode("utf-8"))
-        duration = ref_audio_len + int(ref_audio_len / ref_text_len * gen_text_len / speed)
+        if fix_duration is not None:
+            duration = int(fix_duration * target_sample_rate / hop_length)
+        else:
+            # Calculate duration
+            ref_text_len = len(ref_text.encode("utf-8"))
+            gen_text_len = len(gen_text.encode("utf-8"))
+            duration = ref_audio_len + int(ref_audio_len / ref_text_len * gen_text_len / speed)
 
         # inference
         with torch.inference_mode():
